@@ -1,0 +1,14 @@
+pymupdf>=1.22.0
+pydantic>=2.0
+pytest
+Pillow
+numpy
+# Environment loader for .env files
+python-dotenv
+# Optional: Google GenAI SDK for Gemini multimodal extraction (opt-in)
+google-genai
+pytesseract
+
+# Note: System package `tesseract` is required for OCR to work. On Debian/Ubuntu:
+#   sudo apt-get install tesseract-ocr
+# On Windows, install the Tesseract binary and ensure it's on PATH.
