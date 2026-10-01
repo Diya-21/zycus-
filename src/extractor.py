@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import logging
 import time
+import hashlib
 from typing import List, Dict, Any
 from pathlib import Path
 
@@ -30,6 +31,60 @@ load_dotenv()
 
 # Gemini usage statistics
 GEMINI_STATS = {"calls": 0, "success": 0, "failures": 0}
+
+
+def _cache_enabled() -> bool:
+    value = os.environ.get("GEMINI_CACHE_ENABLED", "true")
+    return str(value).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _document_cache_key(doc: IngestedDocument) -> str:
+    path = Path(doc.path).resolve()
+    stat = path.stat() if path.exists() else None
+    raw = f"{path}|{stat.st_size if stat else 0}|{stat.st_mtime_ns if stat else 0}|{doc.filename}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _document_cache_dir() -> Path | None:
+    if not _cache_enabled():
+        return None
+    cache_dir = os.environ.get("GEMINI_CACHE_DIR", str(Path.cwd() / ".gemini_cache"))
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    return cache_path
+
+
+def _document_cache_path(doc: IngestedDocument) -> Path | None:
+    cache_dir = _document_cache_dir()
+    if cache_dir is None:
+        return None
+    return cache_dir / f"{_document_cache_key(doc)}.json"
+
+
+def _load_cached_successful_extraction(doc: IngestedDocument) -> Dict[str, Any] | None:
+    cache_path = _document_cache_path(doc)
+    if cache_path is None or not cache_path.exists():
+        return None
+    try:
+        with open(cache_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("status") == "success":
+            return data.get("payload")
+    except Exception:
+        return None
+    return None
+
+
+def _store_successful_extraction(doc: IngestedDocument, payload: Dict[str, Any]) -> None:
+    cache_path = _document_cache_path(doc)
+    if cache_path is None:
+        return
+    try:
+        cache_data = {"status": "success", "payload": payload}
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump(cache_data, fh, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        logger.debug("Failed to persist Gemini cache entry for %s", doc.path)
 
 
 def _normalize_gemini_failure(exc: Any, model_name: str = "gemini-2.5-flash") -> str:
@@ -69,10 +124,10 @@ def _normalize_gemini_failure(exc: Any, model_name: str = "gemini-2.5-flash") ->
 def _normalize_gemini_payload(payload: Any) -> Any:
     """Normalize Gemini output to the existing assignment schema expectations.
 
-    The assignment schema expects string fields for currencies, totals, tax entries,
-    line-item amounts, and similar numerics. Gemini may emit float/int values or
-    nulls; convert numeric values to strings without rounding or inventing data,
-    while leaving nulls as empty strings for schema fields that are typed as str.
+    Numeric values are converted to dot-decimal strings without rounding or
+    inventing missing data. Standalone amounts are only mapped to quantity=1 and
+    unit_price=amount when the document clearly supports that interpretation, and
+    tax fields are preserved in the ERP-compatible shape (tax_rate / tax_amount).
     """
     str_fields = {
         "invoice_number",
@@ -115,6 +170,22 @@ def _normalize_gemini_payload(payload: Any) -> Any:
         "file",
     }
 
+    def to_decimal_string(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            s = value.strip()
+            if s == "":
+                return ""
+            if s.startswith(("$", "€", "£", "¥", "₹")):
+                s = s[1:]
+            if s.endswith("%"):
+                s = s[:-1]
+            return s
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        return str(value)
+
     def normalize(value: Any) -> Any:
         if isinstance(value, dict):
             for key, item in list(value.items()):
@@ -124,25 +195,53 @@ def _normalize_gemini_payload(payload: Any) -> Any:
                     elif isinstance(item, (int, float)) and not isinstance(item, bool):
                         value[key] = str(item)
                     elif isinstance(item, str):
-                        value[key] = item
+                        if key in {"quantity", "unit_price", "gross_total", "subtotal", "total_tax_amount", "discount_amount", "freight_charges", "insurance_charges", "extra_charges", "excise_duties", "discount", "discount_percentage", "tax_rate", "tax_amount", "total"}:
+                            value[key] = to_decimal_string(item)
+                        else:
+                            value[key] = item
                     else:
                         value[key] = normalize(item)
                 else:
                     value[key] = normalize(item)
-            # If a line item provides an explicit 'amount' but no quantity/unit_price,
-            # conservatively map it to quantity=1 and unit_price=amount so ERP can
-            # recompute the line base. Only do this when both qty and unit_price are
-            # empty and an amount string is present.
-            try:
-                if "amount" in value and "quantity" in value and "unit_price" in value:
-                    q = value.get("quantity")
-                    up = value.get("unit_price")
-                    amt = value.get("amount")
-                    if (isinstance(amt, str) and amt.strip()) and (not q) and (not up):
-                        value["quantity"] = "1"
-                        value["unit_price"] = amt
-            except Exception:
-                pass
+
+            tax_like = any(key in value for key in ("tax_rate", "tax_name", "tax_type", "tax_type_code"))
+            if "name" in value and "amount" in value and not tax_like:
+                name = str(value.get("name", "")).lower()
+                if "tax" in name:
+                    tax_like = True
+
+            amount = None
+            if "amount" in value and value.get("quantity") in (None, "") and value.get("unit_price") in (None, ""):
+                if tax_like:
+                    value["tax_amount"] = to_decimal_string(value.get("amount"))
+                    value.setdefault("tax_rate", "")
+                else:
+                    amount = value.get("amount")
+
+            if amount is not None:
+                amt_str = to_decimal_string(amount)
+                if amt_str not in ("", "0", "0.0", "0.00"):
+                    value["quantity"] = "1"
+                    value["unit_price"] = amt_str
+                    if "total" not in value:
+                        value["total"] = amt_str
+
+            if "amount" in value and "tax_amount" not in value and "quantity" not in value and "unit_price" not in value:
+                if tax_like:
+                    value["tax_amount"] = to_decimal_string(value.get("amount"))
+                    value.setdefault("tax_rate", "")
+
+            if "tax_amount" in value and "tax_rate" in value:
+                value["tax_amount"] = to_decimal_string(value.get("tax_amount"))
+                value["tax_rate"] = to_decimal_string(value.get("tax_rate"))
+            elif "tax_amount" in value:
+                value["tax_amount"] = to_decimal_string(value.get("tax_amount"))
+                value.setdefault("tax_rate", "")
+
+            if "taxes" in value and isinstance(value["taxes"], list):
+                value["taxes"] = [normalize(item) for item in value["taxes"]]
+            if "line_items" in value and isinstance(value["line_items"], list):
+                value["line_items"] = [normalize(item) for item in value["line_items"]]
             return value
 
         if isinstance(value, list):
@@ -154,6 +253,10 @@ def _normalize_gemini_payload(payload: Any) -> Any:
         return value
 
     return normalize(payload)
+
+
+def _invoke_gemini_api(client: Any, model_name: str, contents: List[Any]) -> Any:
+    return client.models.generate_content(model=model_name, contents=contents)
 
 
 def _extract_with_gemini(doc: "IngestedDocument") -> tuple[dict | None, dict]:
@@ -170,7 +273,16 @@ def _extract_with_gemini(doc: "IngestedDocument") -> tuple[dict | None, dict]:
         "called": False,
         "success": False,
         "error": None,
+        "from_cache": False,
     }
+
+    cached_payload = _load_cached_successful_extraction(doc)
+    if cached_payload is not None:
+        meta["configured"] = bool(os.environ.get("GEMINI_API_KEY"))
+        meta["success"] = True
+        meta["from_cache"] = True
+        logger.info("Using cached successful Gemini extraction for %s", doc.path)
+        return cached_payload, meta
 
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
@@ -202,12 +314,23 @@ def _extract_with_gemini(doc: "IngestedDocument") -> tuple[dict | None, dict]:
         # Build prompt and contents
         text_body = _join_text(doc)
         system = (
-            "Extract invoice-like structured fields from the provided document. "
+            "Extract invoice-like structured fields from the provided document using only evidence actually present in the PDF. "
             "Return a JSON object with keys: doc_type,is_payable,payables (list). "
             "Each payable must contain invoice_number,invoice_date,due_date,invoice_type,currency,"
-            "supplier{ name,vat_id },payment_term_text,po_number,gross_total,subtotal,total_tax_amount,"
-            "discount_amount,freight_charges,insurance_charges,extra_charges,excise_duties,taxes,line_items."
-            "Do NOT invent values; if evidence is missing return empty strings or empty arrays."
+            "supplier{name,vat_id},payment_term_text,po_number,gross_total,subtotal,total_tax_amount,"
+            "discount_amount,freight_charges,insurance_charges,extra_charges,excise_duties,taxes,line_items. "
+            "Use these accounting rules exactly: "
+            "(1) ERP gross is recomputed as quantity * unit_price - line discounts + line taxes - header discount + header taxes + supported charges. "
+            "(2) unit_price is NET, not tax-inclusive. "
+            "(3) Do not replace quantity*unit_price with the document's printed line total unless the document explicitly shows a standalone amount for that line with no quantity/rate decomposition. In that case use quantity = 1 and unit_price = standalone amount, only when clearly supported. "
+            "(4) Never convert taxes into ordinary line prices; taxes must remain tax objects with tax_rate and/or tax_amount in the schema expected by ERP. "
+            "(5) If the document gives only a tax amount and no rate, keep the amount in tax_amount and leave tax_rate empty. "
+            "(6) Preserve negative adjustments or negative charges exactly as shown. "
+            "(7) Do not invent quantity, price, tax, discount, freight, or other charges. Leave fields empty when unsupported. "
+            "(8) Separate ordinary line items, standalone charge/adjustment lines, tax lines, discount lines, and freight/other charge lines distinctly when present. "
+            "(9) For non-payable documents, set is_payable to false and do not fabricate payable records. "
+            "(10) A Gemini/API failure must not be classified as a non-payable document; return a clear gemini_error or explicit extraction failure payload. "
+            "Output valid JSON only."
         )
 
         prompt_text = f"{system}\n\nDOCUMENT_TEXT:\n{text_body}"
@@ -230,7 +353,7 @@ def _extract_with_gemini(doc: "IngestedDocument") -> tuple[dict | None, dict]:
             try:
                 GEMINI_STATS["calls"] += 1
                 meta["called"] = True
-                response = client.models.generate_content(model=model_name, contents=contents)
+                response = _invoke_gemini_api(client, model_name, contents)
                 break
             except Exception as exc:
                 status_code = None
@@ -325,6 +448,8 @@ def _extract_with_gemini(doc: "IngestedDocument") -> tuple[dict | None, dict]:
         except Exception:
             # If normalization fails, surface the raw payload and let the caller handle it.
             pass
+
+        _store_successful_extraction(doc, payload)
 
         # Print the extracted JSON for inspection (sanitized)
         try:

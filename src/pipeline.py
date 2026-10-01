@@ -119,7 +119,7 @@ def process_file(input_path: Path, output_dir: Path) -> Dict[str, Any]:
             fh.write(out_file.model_dump_json(indent=2))
         return summary
 
-    if not extracted.get("is_payable"):
+    if not extracted.get("is_payable") and extracted.get("doc_type") not in {"EXTRACTION_FAILED", "UNKNOWN"}:
         from src.models import DeclinedRecord
         out_file.declined.append(DeclinedRecord(doc_type=extracted.get("doc_type", "UNKNOWN"), reason="Document is not a payable"))
         out_path = output_dir / (input_path.stem + ".json")
