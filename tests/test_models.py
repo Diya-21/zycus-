@@ -133,6 +133,55 @@ def test_numeric_gemini_values_are_stringified_for_schema():
     assert normalized["line_items"][0]["taxes"][0]["tax_amount"] == "12.34"
 
 
+def test_number_normalization_commas_and_parentheses():
+    payload = {
+        "taxes": [
+            {"tax_amount": "1,234.50"},
+            {"tax_amount": "(0.28)"},
+            {"tax_amount": "$1,234.50"},
+            {"tax_amount": "USD 1,234.50"},
+        ]
+    }
+    normalized = _normalize_gemini_payload(payload)
+    assert normalized["taxes"][0]["tax_amount"] == "1234.50"
+    assert normalized["taxes"][1]["tax_amount"] == "-0.28"
+    assert normalized["taxes"][2]["tax_amount"] == "1234.50"
+    assert normalized["taxes"][3]["tax_amount"] == "1234.50"
+
+
+def test_tax_row_is_preserved_as_tax_not_line_item():
+    payload = {"taxes": [{"name": "Sales Tax", "amount": "1,234.50"}]}
+    normalized = _normalize_gemini_payload(payload)
+    # tax should be represented as tax_amount, not converted into a line_items entry
+    assert "taxes" in normalized
+    assert normalized["taxes"][0]["tax_amount"] == "1234.50"
+    # ensure no accidental quantity/unit_price appears in the same dict
+    assert normalized["taxes"][0].get("quantity", "") == ""
+    assert normalized["taxes"][0].get("unit_price", "") == ""
+
+
+def test_cache_key_is_content_based(tmp_path):
+    # create two files with identical bytes at different paths
+    data = b"%PDF-1.4\n%dummy"
+    f1 = tmp_path / "a" / "same.pdf"
+    f1.parent.mkdir(parents=True, exist_ok=True)
+    f1.write_bytes(data)
+    f2 = tmp_path / "b" / "same_copy.pdf"
+    f2.parent.mkdir(parents=True, exist_ok=True)
+    f2.write_bytes(data)
+
+    from src.extractor import _document_cache_key
+    from src.ingestion import IngestedDocument
+
+    d1 = IngestedDocument(filename=f1.name, path=f1, pages=[])
+    d2 = IngestedDocument(filename=f2.name, path=f2, pages=[])
+
+    k1 = _document_cache_key(d1)
+    k2 = _document_cache_key(d2)
+    assert isinstance(k1, str) and isinstance(k2, str)
+    assert k1 == k2
+
+
 def test_genuine_non_payable_document_is_declined(monkeypatch, tmp_path):
     pdf_path = tmp_path / "REMINDER.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n")

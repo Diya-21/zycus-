@@ -39,10 +39,17 @@ def _cache_enabled() -> bool:
 
 
 def _document_cache_key(doc: IngestedDocument) -> str:
-    path = Path(doc.path).resolve()
-    stat = path.stat() if path.exists() else None
-    raw = f"{path}|{stat.st_size if stat else 0}|{stat.st_mtime_ns if stat else 0}|{doc.filename}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    # Use a stable content-based SHA-256 of the file bytes so the same PDF
+    # content produces the same cache key regardless of filesystem path.
+    try:
+        p = Path(doc.path)
+        if p.exists():
+            data = p.read_bytes()
+            return hashlib.sha256(data).hexdigest()
+    except Exception:
+        # Fall back to a filename-based key if file read fails (rare, testable)
+        raw = f"{str(doc.path)}|{doc.filename}"
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _document_cache_dir() -> Path | None:
@@ -177,10 +184,26 @@ def _normalize_gemini_payload(payload: Any) -> Any:
             s = value.strip()
             if s == "":
                 return ""
-            if s.startswith(("$", "€", "£", "¥", "₹")):
-                s = s[1:]
+            # Parentheses denote negative numbers in accounting formats
+            negative = False
+            if s.startswith("(") and s.endswith(")"):
+                negative = True
+                s = s[1:-1].strip()
+
+            # Remove common currency prefixes (e.g. "$", "€", "USD ")
+            s = re.sub(r"^[\$€£¥₹]\s*", "", s)
+            s = re.sub(r"^[A-Z]{3}\s+", "", s)
+
+            # Remove grouping commas
+            s = s.replace(",", "")
+
+            # Remove trailing percent if present
             if s.endswith("%"):
                 s = s[:-1]
+
+            s = s.strip()
+            if negative and s:
+                s = f"-{s}"
             return s
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return str(value)
@@ -324,6 +347,8 @@ def _extract_with_gemini(doc: "IngestedDocument") -> tuple[dict | None, dict]:
             "(2) unit_price is NET, not tax-inclusive. "
             "(3) Do not replace quantity*unit_price with the document's printed line total unless the document explicitly shows a standalone amount for that line with no quantity/rate decomposition. In that case use quantity = 1 and unit_price = standalone amount, only when clearly supported. "
             "(4) Never convert taxes into ordinary line prices; taxes must remain tax objects with tax_rate and/or tax_amount in the schema expected by ERP. "
+            "Named tax rows such as 'Sales Tax', 'Gross Receipts Tax', 'VAT', 'GST', or similarly labeled rows that contain only a tax amount should be placed into the 'taxes' array (with tax_name/tax_amount), not converted into ordinary line_items. "
+            "Do NOT convert a tax amount into quantity=1 / unit_price=amount merely because it appears as a standalone amount. "
             "(5) If the document gives only a tax amount and no rate, keep the amount in tax_amount and leave tax_rate empty. "
             "(6) Preserve negative adjustments or negative charges exactly as shown. "
             "(7) Do not invent quantity, price, tax, discount, freight, or other charges. Leave fields empty when unsupported. "

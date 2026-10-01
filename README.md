@@ -186,9 +186,9 @@ At the same time, the implementation remains conservative. The LLM is used only 
 
 ## Validation and Limitations
 
-The solution was validated on the successful end-to-end path for `INV-31`. In that case, the extracted accounting data reconciled correctly with the fixed ERP oracle provided in `candidate_kit/erp.py`.
+INV-31 was used as a reconciliation regression case during development. Specifically, a simulated Gemini-style extraction payload constructed from observed document evidence could be normalized and reconciled by the ERP oracle in a controlled test. Because the final verification steps were performed using a simulated/extracted payload (not a fresh live Gemini call), the repository does not claim a recent live Gemini verification of INV-31 after the final extractor changes — the Gemini quota was exhausted during development and a live re-run was not possible.
 
-Broader bulk testing also showed that Gemini free-tier usage limits can trigger provider-side quota exhaustion during large runs. Those cases were explicitly handled as controlled extraction failures rather than as silent record fabrication. The repository does not claim that all documents in a large dataset were successfully processed in every run, and it does not invent success rates, accuracy numbers, or performance metrics that were not measured.
+Broader bulk testing also showed that Gemini free-tier usage limits can trigger provider-side quota exhaustion during large runs. Those cases are treated as controlled extraction failures rather than as silent record fabrication. The repository does not claim that all documents in a large dataset were successfully processed in every run, and it does not invent success rates, accuracy numbers, or performance metrics that were not measured.
 
 ## Submission Notes
 
